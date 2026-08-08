@@ -1,89 +1,108 @@
-#include <OneWire.h>
-#include <Adafruit_NeoPixel.h>
+// ---- WiFi credentials ----
+const char* WIFI_SSID     = "<YOUR_SSID>";
+const char* WIFI_PASSWORD = "<YOUR_PASSWORD>";
+/*
+ * ESP8266 + AHT10 + NanoNeoBridge, with a simple live web page
+ * -------------------------------------------------------------
+ * Serves:
+ *   GET /       -> HTML page, auto-refreshes readings every 2s via fetch()
+ *   GET /data   -> JSON: {"temperature":23.4,"humidity":41.2}
+ *
+ * Temperature/humidity values shift from yellow to red client-side as they
+ * approach the "unsafe" thresholds defined below (see TEMP_SAFE_MAX /
+ * TEMP_UNSAFE_MAX / HUM_SAFE_MAX / HUM_UNSAFE_MAX in the HTML's <script>).
+ * These are just example comfort/heat-stress thresholds, not a medical
+ * standard — tune them for your environment.
+ */
 
-#define ONE_WIRE_BUS 2
-#define LEDSTRIP_PIN 14
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <AHT10.h>
+#include <Wire.h>
+#include "NanoNeoBridge.h"
+#include "html_temperature_humidity.h"
 
-OneWire sensor(ONE_WIRE_BUS);
-Adafruit_NeoPixel strip(5, LEDSTRIP_PIN, NEO_GRB + NEO_KHZ800);
+// ---- Static IP config ----
+IPAddress local_IP(192, 168, 1, 154);
+IPAddress gateway(192, 168, 1, 1);     // adjust to match your router if different
+IPAddress subnet(255, 255, 255, 0);
 
-void setup(void)
-{
-	Serial.begin(9600);
-	strip.begin();           // INITIALIZE NeoPixel strip object (REQUIRED)
-	strip.show();            // Turn OFF all pixels ASAP
-	strip.setBrightness(50); // Set BRIGHTNESS to about 1/5 (max = 255)
+// ---- NeoPixel bridge ----
+#define SLAVE_ADDR 0x08
+#define NUM_LEDS   10
+NanoNeoBridge leds(SLAVE_ADDR, NUM_LEDS);
+
+// ---- AHT10 sensor ----
+AHT10 myAHT10(AHT10_ADDRESS_0X38);
+
+// ---- Web server ----
+ESP8266WebServer server(80);
+
+// Latest readings, updated once per loop() pass
+float currentTempC = NAN;
+float currentHumidity = NAN;
+
+void handleRoot() {
+	server.send(200, "text/html", html);
 }
 
-void loop(void){
-	byte i;
-	byte present = 0;
-	byte data[9];
-	byte addr[8];
+void handleData() {
+  char json[64];
+  snprintf(json, sizeof(json), "{\"temperature\":%.1f,\"humidity\":%.1f}",
+           currentTempC, currentHumidity);
+  server.send(200, "application/json", json);
+}
 
-	if (!sensor.search(addr)){
-		Serial.println("No more addresses.");
-		Serial.println();
-		sensor.reset_search();
-		delay(250);
-		return;
-	}
+void setup(void) {
+  Serial.begin(9600);
 
-	Serial.print("ROM =");
-	for (i = 0; i < 8; i++){
-		Serial.write(' ');
-		Serial.print(addr[i], HEX);
-	}
+  leds.begin();
+  leds.show();
+  leds.setBrightness(50);
+  myAHT10.begin();
 
-	if (OneWire::crc8(addr, 7) != addr[7]){
-		Serial.println("CRC is not valid!");
-		return;
-	}
-	Serial.println();
+  if (!WiFi.config(local_IP, gateway, subnet)) {
+    Serial.println("Static IP configuration failed");
+  }
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("Connected! IP address: ");
+  Serial.println(WiFi.localIP());
 
-	// the first ROM byte indicates which chip
-	switch (addr[0]){
-	case 0x80:
-		Serial.println("Found Satelight Sensor Device"); // Family code detected
-		break;
-	default:
-		Serial.println("Code not implemented for this device.");
-		return;
-	}
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.begin();
+  Serial.println("Web server started.");
+}
 
-	present = sensor.reset();
-	sensor.select(addr);
-	sensor.write(0x01); // Read Scratchpad
+void loop(void) {
+  server.handleClient(); // must be called often, so it's sprinkled below too
 
-	Serial.print("Data = ");
-	Serial.print(present, HEX);
-	Serial.print(" ");
-	for (i = 0; i < 9; i++){ // we need 9 bytes
-		data[i] = sensor.read();
-		Serial.print(data[i], HEX);
-		Serial.print(" ");
-	}
-	Serial.print(" CRC=");
-	Serial.print(OneWire::crc8(data, 8), HEX);
-	Serial.println();
+  currentTempC = myAHT10.readTemperature();
+  currentHumidity = myAHT10.readHumidity();
 
-	// Convert the data to actual luminence
-	uint16_t lux = (data[1] << 8) | data[0];
-	Serial.print("Luminence = ");
-	Serial.print(lux);
-	Serial.println(" lx");
+  Serial.print(F("Temperature:")); Serial.print(currentTempC); Serial.print(",");
+  Serial.print(F("Humidity:")); Serial.println(currentHumidity);
+  delay(1000);
+  server.handleClient();
 
-	// Flash leds
-	// Set in all pixels to yellow
-	for (uint8_t fade_in = 0 ; fade_in < 255 ; fade_in += 5){
-		for (int i = 0; i <= 5; i++) { strip.setPixelColor(i, strip.Color(fade_in, fade_in, fade_in)); } // Set pixel to yellow			
-		strip.show(); // Update the pixel strip
-		delay(20);
-	}
-	// Set out all pixels to black
-	for (uint8_t fade_out = 255 ; fade_out > 0 ; fade_out -= 5){
-		for (int i = 0; i <= 5; i++) { strip.setPixelColor(i, strip.Color(fade_out, fade_out, fade_out)); } // Set pixel to yellow			
-		strip.show(); // Update the pixel strip
-		delay(20);
-	}
+  // Fade all pixels in to white
+  for (uint8_t fade_in = 0; fade_in < 255; fade_in += 5) {
+    for (int i = 0; i <= 5; i++) { leds.setPixel(i, fade_in, fade_in, fade_in); }
+    leds.show();
+    delay(20);
+    server.handleClient(); // keep the web server responsive during the fade
+  }
+  // Fade all pixels out to black
+  for (uint8_t fade_out = 255; fade_out > 0; fade_out -= 5) {
+    for (int i = 0; i <= 5; i++) { leds.setPixel(i, fade_out, fade_out, fade_out); }
+    leds.show();
+    delay(20);
+    server.handleClient();
+  }
 }
