@@ -1,8 +1,3 @@
-// ---- WiFi credentials ----
-// Loaded from EEPROM at boot (see loadCredentialsFromEEPROM). Buffers, not
-// literals, since the failsafe AP flow needs to write into them.
-char WIFI_SSID[33]      = "";
-char WIFI_PASSWORD[129] = "";
 /*
  * ESP8266 + AHT10 + NanoNeoBridge, with a simple live web page
  * -------------------------------------------------------------
@@ -25,6 +20,8 @@ char WIFI_PASSWORD[129] = "";
  * board reboots into normal station mode.
  */
 
+#include <Arduino.h>
+#include <SC_declarations.h>
 #include <EEPROM.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
@@ -34,19 +31,15 @@ char WIFI_PASSWORD[129] = "";
 #include "html_temperature_humidity.h"
 #include "html_update_wifi_credentials_.h"
 
-// ---- EEPROM layout for WiFi failsafe ----
-#define EEPROM_SIZE        200
-#define EEPROM_FLAG_ADDR   0    // 1 byte: EEPROM_VALID_FLAG once credentials are stored
-#define EEPROM_SSID_ADDR   1    // 33 bytes
-#define EEPROM_PASS_ADDR   34   // 129 bytes
-#define EEPROM_SUBNET_ADDR 163  // 1 byte, static IP 3rd octet (192.168.X.___)
-#define EEPROM_HOST_ADDR   164  // 1 byte, static IP 4th octet (192.168.___.X)
-#define EEPROM_VALID_FLAG  0xAA
+// ---- WiFi credentials ----
+// Loaded from EEPROM at boot (see loadCredentialsFromEEPROM). Buffers, not
+// literals, since the failsafe AP flow needs to write into them.
+char WIFI_SSID[33]      = "";
+char WIFI_PASSWORD[129] = "";
 
 // ---- Failsafe access point (used only when no credentials are stored) ----
 const char* AP_SSID     = "Satelight-Setup";
 const char* AP_PASSWORD = ""; // open network for setup; set a password if you'd like
-
 bool apMode = false; // true while running as the credential-setup access point
 
 // ---- Static IP config ----
@@ -55,8 +48,6 @@ IPAddress gateway(192, 168, 1, 1);     // adjust to match your router if differe
 IPAddress subnet(255, 255, 255, 0);
 
 // ---- NeoPixel bridge ----
-#define SLAVE_ADDR 0x08
-#define NUM_LEDS   10
 NanoNeoBridge leds(SLAVE_ADDR, NUM_LEDS);
 
 // ---- AHT10 sensor ----
@@ -68,87 +59,6 @@ ESP8266WebServer server(80);
 // Latest readings, updated once per loop() pass
 float currentTempC = NAN;
 float currentHumidity = NAN;
-
-void handleRoot() {
-	server.send(200, "text/html", html);
-}
-
-void handleData() {
-  char json[64];
-  snprintf(json, sizeof(json), "{\"temperature\":%.1f,\"humidity\":%.1f}",
-           currentTempC, currentHumidity);
-  server.send(200, "application/json", json);
-}
-
-// ---- WiFi failsafe: EEPROM credential storage ----
-
-// Returns true if valid credentials were found and loaded into
-// WIFI_SSID / WIFI_PASSWORD / local_IP.
-bool loadCredentialsFromEEPROM() {
-  if (EEPROM.read(EEPROM_FLAG_ADDR) != EEPROM_VALID_FLAG) {
-    return false;
-  }
-  for (uint8_t i = 0; i < sizeof(WIFI_SSID); i++) {
-    WIFI_SSID[i] = EEPROM.read(EEPROM_SSID_ADDR + i);
-  }
-  for (uint8_t i = 0; i < sizeof(WIFI_PASSWORD); i++) {
-    WIFI_PASSWORD[i] = EEPROM.read(EEPROM_PASS_ADDR + i);
-  }
-  local_IP[2] = EEPROM.read(EEPROM_SUBNET_ADDR);
-  local_IP[3] = EEPROM.read(EEPROM_HOST_ADDR);
-  return true;
-}
-
-void saveCredentialsToEEPROM(const String& ssid, const String& pass,
-                              uint8_t subnetOctet, uint8_t hostOctet) {
-  for (uint8_t i = 0; i < sizeof(WIFI_SSID); i++) {
-    EEPROM.write(EEPROM_SSID_ADDR + i, i < ssid.length() ? ssid[i] : 0);
-  }
-  for (uint8_t i = 0; i < sizeof(WIFI_PASSWORD); i++) {
-    EEPROM.write(EEPROM_PASS_ADDR + i, i < pass.length() ? pass[i] : 0);
-  }
-  EEPROM.write(EEPROM_SUBNET_ADDR, subnetOctet);
-  EEPROM.write(EEPROM_HOST_ADDR, hostOctet);
-  EEPROM.write(EEPROM_FLAG_ADDR, EEPROM_VALID_FLAG);
-  EEPROM.commit();
-}
-
-// Serves the "WiFi Setup" form (failsafe access point mode)
-void handleUpdateForm() {
-  server.send(200, "text/html", html_update_wifi_credentials);
-}
-
-// Handles the form POST, stores credentials, then reboots into normal WiFi mode
-void handleUpdate() {
-  String newSSID = server.arg("NEW_SSID");
-  String newPass = server.arg("NEW_PASS");
-  uint8_t subnetOctet = server.arg("NEW_ADDR_SUBNET").toInt();
-  uint8_t hostOctet   = server.arg("NEW_ADDR_HOST").toInt();
-
-  saveCredentialsToEEPROM(newSSID, newPass, subnetOctet, hostOctet);
-
-  server.send(200, "text/html",
-    "<html><body style='background:#10151c;color:#eee;font-family:Arial;"
-    "text-align:center;padding-top:40px;'><h2>Saved. Rebooting...</h2></body></html>");
-  delay(1000);
-  ESP.restart();
-}
-
-// No stored credentials found: become an access point so credentials can be entered
-void startFailsafeAccessPoint() {
-  apMode = true;
-  Serial.println("No WiFi credentials found. Starting failsafe access point...");
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASSWORD);
-  Serial.print("AP started. Connect to \"");
-  Serial.print(AP_SSID);
-  Serial.print("\" and visit ");
-  Serial.println(WiFi.softAPIP());
-
-  server.on("/", handleUpdateForm);
-  server.on("/update", HTTP_POST, handleUpdate);
-  server.begin();
-}
 
 void setup(void) {
   Serial.begin(9600);
@@ -214,4 +124,84 @@ void loop(void) {
     delay(20);
     server.handleClient();
   }
+}
+
+void handleRoot() {
+	server.send(200, "text/html", html);
+}
+
+void handleData() {
+  char json[64];
+  snprintf(json, sizeof(json), "{\"temperature\":%.1f,\"humidity\":%.1f}",
+           currentTempC, currentHumidity);
+  server.send(200, "application/json", json);
+}
+
+/** ---- WiFi failsafe: EEPROM credential storage ----
+ * Returns true if valid credentials were found and loaded into
+ * WIFI_SSID / WIFI_PASSWORD / local_IP.
+*/
+bool loadCredentialsFromEEPROM() {
+  if (EEPROM.read(EEPROM_FLAG_ADDR) != EEPROM_VALID_FLAG) {
+    return false;
+  }
+  for (uint8_t i = 0; i < sizeof(WIFI_SSID); i++) {
+    WIFI_SSID[i] = EEPROM.read(EEPROM_SSID_ADDR + i);
+  }
+  for (uint8_t i = 0; i < sizeof(WIFI_PASSWORD); i++) {
+    WIFI_PASSWORD[i] = EEPROM.read(EEPROM_PASS_ADDR + i);
+  }
+  local_IP[2] = EEPROM.read(EEPROM_SUBNET_ADDR);
+  local_IP[3] = EEPROM.read(EEPROM_HOST_ADDR);
+  return true;
+}
+
+void saveCredentialsToEEPROM(const String& ssid, const String& pass, uint8_t subnetOctet, uint8_t hostOctet) {
+  for (uint8_t i = 0; i < sizeof(WIFI_SSID); i++) {
+    EEPROM.write(EEPROM_SSID_ADDR + i, i < ssid.length() ? ssid[i] : 0);
+  }
+  for (uint8_t i = 0; i < sizeof(WIFI_PASSWORD); i++) {
+    EEPROM.write(EEPROM_PASS_ADDR + i, i < pass.length() ? pass[i] : 0);
+  }
+  EEPROM.write(EEPROM_SUBNET_ADDR, subnetOctet);
+  EEPROM.write(EEPROM_HOST_ADDR, hostOctet);
+  EEPROM.write(EEPROM_FLAG_ADDR, EEPROM_VALID_FLAG);
+  EEPROM.commit();
+}
+
+/** Serves the "WiFi Setup" form (failsafe access point mode) */
+void handleUpdateForm() {
+  server.send(200, "text/html", html_update_wifi_credentials);
+}
+
+/** Handles the form POST, stores credentials, then reboots into normal WiFi mode */
+void handleUpdate() {
+  String newSSID = server.arg("NEW_SSID");
+  String newPass = server.arg("NEW_PASS");
+  uint8_t subnetOctet = server.arg("NEW_ADDR_SUBNET").toInt();
+  uint8_t hostOctet   = server.arg("NEW_ADDR_HOST").toInt();
+
+  saveCredentialsToEEPROM(newSSID, newPass, subnetOctet, hostOctet);
+
+  server.send(200, "text/html",
+    "<html><body style='background:#10151c;color:#eee;font-family:Arial;"
+    "text-align:center;padding-top:40px;'><h2>Saved. Rebooting...</h2></body></html>");
+  delay(1000);
+  ESP.restart();
+}
+
+/** No stored credentials found: become an access point so credentials can be entered */
+void startFailsafeAccessPoint() {
+  apMode = true;
+  Serial.println("No WiFi credentials found. Starting failsafe access point...");
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  Serial.print("AP started. Connect to \"");
+  Serial.print(AP_SSID);
+  Serial.print("\" and visit ");
+  Serial.println(WiFi.softAPIP());
+
+  server.on("/", handleUpdateForm);
+  server.on("/update", HTTP_POST, handleUpdate);
+  server.begin();
 }
