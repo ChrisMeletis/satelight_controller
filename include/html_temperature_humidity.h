@@ -1,4 +1,4 @@
-const char* html = R"HTML(
+const char html[] = R"=====(
 <!DOCTYPE html>
 <html>
 <head>
@@ -58,7 +58,7 @@ const char* html = R"HTML(
     // Inside [COMFORT_MIN, COMFORT_MAX] the reading stays the default color.
     // Deviating from that range fades toward yellow, then toward red.
     const TEMP_COMFORT_MIN = 20;   // deg C
-    const TEMP_COMFORT_MAX = 28;   // deg C
+    const TEMP_COMFORT_MAX = 25;   // deg C
     const TEMP_WARN_DELTA  = 5;    // deviation (past the range) that's fully yellow
     const TEMP_DANGER_DELTA = 15;  // deviation that's fully red
 
@@ -121,4 +121,4 @@ const char* html = R"HTML(
   </script>
 </body>
 </html>
-)HTML";
+)=====";
