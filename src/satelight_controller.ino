@@ -41,11 +41,18 @@ char WIFI_PASSWORD[129] = "";
 const char* AP_SSID     = "Satelight-Setup";
 const char* AP_PASSWORD = ""; // open network for setup; set a password if you'd like
 bool apMode = false; // true while running as the credential-setup access point
+const unsigned long AP_RETRY_INTERVAL_MS = 120000; // retry connection after 2 min in AP when no client is connected
+unsigned long lastApRetryMillis = 0;
 
 // ---- Static IP config ----
 IPAddress local_IP(192, 168, 1, 154); // fallback; 3rd/4th octets overwritten from EEPROM
 IPAddress gateway(192, 168, 1, 1);     // adjust to match your router if different
 IPAddress subnet(255, 255, 255, 0);
+
+bool attemptWiFiConnection(unsigned long timeoutMs);
+void startNormalWebServer();
+bool shouldForceFailsafeAP();
+void setForcedFailsafeAP(bool enable);
 
 // ---- NeoPixel bridge ----
 NanoNeoBridge leds(SLAVE_ADDR, NUM_LEDS);
@@ -70,33 +77,48 @@ void setup(void) {
 
   EEPROM.begin(EEPROM_SIZE);
 
+  bool forceAP = shouldForceFailsafeAP();
   if (!loadCredentialsFromEEPROM()) {
     startFailsafeAccessPoint();
     return; // stay in AP / credential-setup mode; loop() just serves the form
   }
 
-  if (!WiFi.config(local_IP, gateway, subnet)) {
-    Serial.println("Static IP configuration failed");
+  if (forceAP) {
+    Serial.println("Forced AP fallback after previous WiFi failure.");
+    setForcedFailsafeAP(false);
+    startFailsafeAccessPoint();
+    return;
   }
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(300);
-    Serial.print(".");
-  }
-  Serial.println();
-  Serial.print("Connected! IP address: ");
-  Serial.println(WiFi.localIP());
 
-  server.on("/", handleRoot);
-  server.on("/data", handleData);
-  server.begin();
-  Serial.println("Web server started.");
+  if (!attemptWiFiConnection(15000)) {
+    Serial.println("Failed to connect to saved WiFi. Restarting into AP mode...");
+    setForcedFailsafeAP(true);
+    delay(100);
+    ESP.restart();
+    return;
+  }
+
+  startNormalWebServer();
 }
 
 void loop(void) {
   if (apMode) {
     server.handleClient(); // only serve the WiFi Setup form until reboot
+
+    if (WiFi.softAPgetStationNum() == 0 && millis() - lastApRetryMillis >= AP_RETRY_INTERVAL_MS) {
+      lastApRetryMillis = millis();
+      Serial.println("No AP clients connected. Retrying saved WiFi connection...");
+      if (attemptWiFiConnection(15000)) {
+        Serial.println("Saved WiFi connected. Leaving AP mode.");
+        server.stop();
+        WiFi.softAPdisconnect(true);
+        WiFi.mode(WIFI_STA);
+        apMode = false;
+        startNormalWebServer();
+        return;
+      }
+      Serial.println("Retry failed. Remaining in AP mode.");
+    }
     return;
   }
 
@@ -166,6 +188,40 @@ void saveCredentialsToEEPROM(const String& ssid, const String& pass, uint8_t sub
   EEPROM.write(EEPROM_SUBNET_ADDR, subnetOctet);
   EEPROM.write(EEPROM_HOST_ADDR, hostOctet);
   EEPROM.write(EEPROM_FLAG_ADDR, EEPROM_VALID_FLAG);
+  EEPROM.write(EEPROM_AP_FALLBACK_ADDR, 0x00);
+  EEPROM.commit();
+}
+
+bool attemptWiFiConnection(unsigned long timeoutMs) {
+  if (!WiFi.config(local_IP, gateway, subnet)) {
+    Serial.println("Static IP configuration failed");
+  }
+
+  WiFi.disconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+    if (millis() - start >= timeoutMs) {
+      Serial.println();
+      Serial.println("WiFi connection attempt timed out.");
+      return false;
+    }
+  }
+  Serial.println();
+  Serial.print("Connected! IP address: ");
+  Serial.println(WiFi.localIP());
+  return true;
+}
+
+bool shouldForceFailsafeAP() {
+  return EEPROM.read(EEPROM_AP_FALLBACK_ADDR) == 0x55;
+}
+
+void setForcedFailsafeAP(bool enable) {
+  EEPROM.write(EEPROM_AP_FALLBACK_ADDR, enable ? 0x55 : 0x00);
   EEPROM.commit();
 }
 
@@ -190,18 +246,37 @@ void handleUpdate() {
   ESP.restart();
 }
 
+void startNormalWebServer() {
+  server.stop();
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.on("/update_wifi", handleUpdateForm);
+  server.on("/update", HTTP_POST, handleUpdate);
+  server.begin();
+  Serial.println("Web server started.");
+}
+
 /** No stored credentials found: become an access point so credentials can be entered */
 void startFailsafeAccessPoint() {
   apMode = true;
+  lastApRetryMillis = millis();
   Serial.println("No WiFi credentials found. Starting failsafe access point...");
+  WiFi.disconnect(true);
   WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
   WiFi.softAP(AP_SSID, AP_PASSWORD);
+  delay(500);
   Serial.print("AP started. Connect to \"");
   Serial.print(AP_SSID);
   Serial.print("\" and visit ");
   Serial.println(WiFi.softAPIP());
+  Serial.println("If no client connects, the device will retry saved WiFi in 2 minutes.");
 
+  server.stop();
   server.on("/", handleUpdateForm);
+  server.on("/update", HTTP_GET, handleUpdateForm);
   server.on("/update", HTTP_POST, handleUpdate);
+  server.onNotFound(handleUpdateForm);
   server.begin();
+  Serial.println("AP web server started.");
 }
