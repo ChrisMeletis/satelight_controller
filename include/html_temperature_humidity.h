@@ -53,6 +53,33 @@ const char html[] = R"=====(
     <div id="status">connecting...</div>
   </div>
 
+  <div class="card" style="margin-top:16px; max-width:420px;">
+    <div class="row">
+      <div class="label">LED Color</div>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <canvas id="colorWheel" width="200" height="200" style="border-radius:8px;background:#fff"></canvas>
+        <div style="display:flex;flex-direction:column;gap:8px;">
+          <div id="colorPreview" style="width:56px;height:56px;border-radius:8px;background:#ffffff;border:1px solid #222"></div>
+          <div style="font-size:0.8rem;color:#8a97a8">White (warm)</div>
+          <input id="whiteSlider" type="range" min="0" max="255" value="0" style="width:120px;">
+        </div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="label">Patterns</div>
+      <div style="display:flex;gap:8px;justify-content:center;margin-top:8px;">
+        <button onclick="setPattern('off')">Off</button>
+        <button onclick="setPattern('static')">Static</button>
+        <button onclick="setPattern('rainbow')">Rainbow</button>
+        <button onclick="setPattern('chase')">Chase</button>
+      </div>
+    </div>
+    <div class="row">
+      <div class="label">Brightness</div>
+      <input id="bright" type="range" min="0" max="255" value="50" style="width:100%;">
+    </div>
+  </div>
+
   <script>
     // Example comfort ranges — tune for your environment.
     // Inside [COMFORT_MIN, COMFORT_MAX] the reading stays the default color.
@@ -118,6 +145,92 @@ const char html[] = R"=====(
     }
     refresh();
     setInterval(refresh, 2000);
+
+    // LED control helpers
+    function sendLedRequest(path) {
+      return fetch(path).catch(()=>{ document.getElementById('status').textContent='LED request failed'; });
+    }
+
+    function hsvToRgb(h, s, v) {
+      let r, g, b;
+      let i = Math.floor(h * 6);
+      let f = h * 6 - i;
+      let p = v * (1 - s);
+      let q = v * (1 - f * s);
+      let t = v * (1 - (1 - f) * s);
+      switch (i % 6) {
+        case 0: r = v, g = t, b = p; break;
+        case 1: r = q, g = v, b = p; break;
+        case 2: r = p, g = v, b = t; break;
+        case 3: r = p, g = q, b = v; break;
+        case 4: r = t, g = p, b = v; break;
+        case 5: r = v, g = p, b = q; break;
+      }
+      return [Math.round(r*255), Math.round(g*255), Math.round(b*255)];
+    }
+
+    // Draw a simple color wheel once
+    const wheel = document.getElementById('colorWheel');
+    const wctx = wheel.getContext('2d');
+    const cw = wheel.width, ch = wheel.height;
+    const cx = cw/2, cy = ch/2, radius = Math.min(cx, cy)-1;
+    const img = wctx.createImageData(cw, ch);
+    for (let y=0;y<ch;y++){
+      for (let x=0;x<cw;x++){
+        const dx = x - cx, dy = y - cy;
+        const d = Math.sqrt(dx*dx+dy*dy);
+        const idx = (y*cw + x)*4;
+        if (d <= radius) {
+          const angle = Math.atan2(dy, dx);
+          const hue = (angle < 0 ? angle + Math.PI*2 : angle) / (Math.PI*2);
+          const sat = d / radius;
+          const [r,g,b] = hsvToRgb(hue, sat, 1);
+          img.data[idx] = r; img.data[idx+1] = g; img.data[idx+2] = b; img.data[idx+3] = 255;
+        } else {
+          img.data[idx] = 255; img.data[idx+1] = 255; img.data[idx+2] = 255; img.data[idx+3] = 0;
+        }
+      }
+    }
+    wctx.putImageData(img, 0, 0);
+
+    let selectedColor = [255,255,255];
+    function updatePreview(){
+      document.getElementById('colorPreview').style.background = `rgb(${selectedColor[0]},${selectedColor[1]},${selectedColor[2]})`;
+    }
+
+    wheel.addEventListener('click', (ev)=>{
+      const rect = wheel.getBoundingClientRect();
+      const x = ev.clientX - rect.left; const y = ev.clientY - rect.top;
+      const dx = x - cx, dy = y - cy; const d = Math.sqrt(dx*dx+dy*dy);
+      if (d > radius) return;
+      const angle = Math.atan2(dy, dx);
+      const hue = (angle < 0 ? angle + Math.PI*2 : angle) / (Math.PI*2);
+      const sat = d / radius;
+      selectedColor = hsvToRgb(hue, sat, 1);
+      updatePreview();
+      const w = document.getElementById('whiteSlider').value;
+      sendLedRequest(`/leds/set?r=${selectedColor[0]}&g=${selectedColor[1]}&b=${selectedColor[2]}&w=${w}`);
+    });
+
+    document.getElementById('whiteSlider').addEventListener('input', (e)=>{
+      const w = e.target.value;
+      document.getElementById('colorPreview').style.filter = `brightness(${100 + (w/255)*50}%)`;
+      // send white adjustment with current RGB
+      sendLedRequest(`/leds/set?r=${selectedColor[0]}&g=${selectedColor[1]}&b=${selectedColor[2]}&w=${w}`);
+    });
+
+    function setPattern(name) {
+      const w = document.getElementById('whiteSlider').value;
+      if (name === 'static') {
+        sendLedRequest(`/leds/pattern?pattern=static&r=${selectedColor[0]}&g=${selectedColor[1]}&b=${selectedColor[2]}&w=${w}`);
+      } else {
+        sendLedRequest(`/leds/pattern?pattern=${name}`);
+      }
+    }
+
+    document.getElementById('bright').addEventListener('input', (e)=>{
+      sendLedRequest(`/leds/brightness?b=${e.target.value}`);
+    });
   </script>
 </body>
 </html>

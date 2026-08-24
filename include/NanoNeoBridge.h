@@ -55,21 +55,38 @@ class NanoNeoBridge {
       const uint8_t maxPayload = 29; // 32 - (cmd + offset + len)
       uint16_t offset = 0;
       bool ok = true;
+        // try the whole frame a few times in case of transient I2C errors
+        const int maxAttempts = 3;
+        for (int attempt = 0; attempt < maxAttempts; ++attempt) {
+          offset = 0;
+          ok = true;
+          while (offset < _frameBytes) {
+            uint8_t len = min((uint16_t)maxPayload, (uint16_t)(_frameBytes - offset));
 
-      while (offset < _frameBytes) {
-        uint8_t len = min((uint16_t)maxPayload, (uint16_t)(_frameBytes - offset));
+            Wire.beginTransmission(_addr);
+            Wire.write(CMD_FRAME_CHUNK);
+            Wire.write((uint8_t)offset);
+            Wire.write(len);
+            Wire.write(_buf + offset, len);
+            uint8_t err = Wire.endTransmission();
+            if (err != 0) {
+              ok = false;
+              Serial.print("NanoNeoBridge::show chunk err offset="); Serial.print(offset);
+              Serial.print(" len="); Serial.print(len);
+              Serial.print(" err="); Serial.println(err);
+              break; // abort this attempt
+            }
 
-        Wire.beginTransmission(_addr);
-        Wire.write(CMD_FRAME_CHUNK);
-        Wire.write((uint8_t)offset);
-        Wire.write(len);
-        Wire.write(_buf + offset, len);
-        uint8_t err = Wire.endTransmission();
-        if (err != 0) ok = false;
+            offset += len;
+          }
 
-        offset += len;
-      }
-      return ok;
+          if (ok) return true;
+          // small backoff and re-init Wire in case the bus/slave needs resetting
+          Serial.print("NanoNeoBridge::show retry "); Serial.println(attempt + 1);
+          delay(10);
+          Wire.begin();
+        }
+        return false;
     }
 
     // Set global brightness (0-255). Takes effect on the slave's next show.
@@ -77,7 +94,20 @@ class NanoNeoBridge {
       Wire.beginTransmission(_addr);
       Wire.write(CMD_BRIGHTNESS);
       Wire.write(value);
-      return Wire.endTransmission() == 0;
+      // retry a few times on transient errors
+      const int maxAttempts = 3;
+      for (int attempt = 0; attempt < maxAttempts; ++attempt) {
+        uint8_t err = Wire.endTransmission();
+        if (err == 0) return true;
+        Serial.print("NanoNeoBridge::setBrightness err="); Serial.println(err);
+        Serial.print("NanoNeoBridge::setBrightness retry "); Serial.println(attempt + 1);
+        delay(10);
+        Wire.begin();
+        Wire.beginTransmission(_addr);
+        Wire.write(CMD_BRIGHTNESS);
+        Wire.write(value);
+      }
+      return false;
     }
 
     // Zero all pixels on the slave immediately (also clears local buffer).
@@ -85,7 +115,19 @@ class NanoNeoBridge {
       memset(_buf, 0, _frameBytes);
       Wire.beginTransmission(_addr);
       Wire.write(CMD_CLEAR);
-      return Wire.endTransmission() == 0;
+      // retry clear a few times
+      const int maxAttempts = 3;
+      for (int attempt = 0; attempt < maxAttempts; ++attempt) {
+        uint8_t err = Wire.endTransmission();
+        if (err == 0) return true;
+        Serial.print("NanoNeoBridge::clear err="); Serial.println(err);
+        Serial.print("NanoNeoBridge::clear retry "); Serial.println(attempt + 1);
+        delay(10);
+        Wire.begin();
+        Wire.beginTransmission(_addr);
+        Wire.write(CMD_CLEAR);
+      }
+      return false;
     }
 
   private:
