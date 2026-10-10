@@ -23,8 +23,8 @@
 #include <Arduino.h>
 #include <SC_declarations.h>
 #include <EEPROM.h>
-#include <ESP8266WiFi.h>
-#include <ESP8266WebServer.h>
+#include <WiFi.h>
+#include <WebServer.h>
 #include <AHT10.h>
 #include <Wire.h>
 #include "NanoNeoBridge.h"
@@ -65,7 +65,7 @@ NanoNeoBridge leds(SLAVE_ADDR, NUM_LEDS);
 AHT10 myAHT10(AHT10_ADDRESS_0X38);
 
 // ---- Web server ----
-ESP8266WebServer server(80);
+WebServer server(80);
 
 // Latest readings, updated once per loop() pass
 float currentTempC = NAN;
@@ -83,38 +83,21 @@ unsigned long lastSensorMillis = 0;
 const unsigned long SENSOR_INTERVAL_MS = 2000;
 
 void setup(void) {
-  Serial.begin(9600);
-  delay(200);
-  Serial.println("setup start");
-
-  // Ensure Wire is initialised before calling any I2C transfers
-  Wire.begin();
-
-  leds.begin();
-  leds.show();
-  leds.setBrightness(50);
-  // Simple startup fade to white
-  for (int v = 0; v <= 255; v += 8) {
-    uint8_t vv = (uint8_t)v;
-    leds.fill(vv, vv, vv);
-    leds.show();
-    delay(10);
-  }
-  myAHT10.begin();
-
+  // Keep serial alive first so we can always see startup diagnostics.
+  Serial.begin(115200);
   EEPROM.begin(EEPROM_SIZE);
 
-  bool forceAP = shouldForceFailsafeAP();
-  if (!loadCredentialsFromEEPROM()) {
-    startFailsafeAccessPoint();
-    return; // stay in AP / credential-setup mode; loop() just serves the form
-  }
-
-  if (forceAP) {
+  if (shouldForceFailsafeAP()) {
     Serial.println("Forced AP fallback after previous WiFi failure.");
     setForcedFailsafeAP(false);
     startFailsafeAccessPoint();
     return;
+  }
+
+  if (!loadCredentialsFromEEPROM()) {
+    Serial.println("No valid WiFi credentials found. Starting failsafe access point...");
+    startFailsafeAccessPoint();
+    return; // stay in AP / credential-setup mode; loop() just serves the form
   }
 
   if (!attemptWiFiConnection(15000)) {
@@ -126,6 +109,25 @@ void setup(void) {
   }
 
   startNormalWebServer();
+
+  // Only initialise devices that are needed in normal WiFi mode after a valid credential record is present.
+  Wire.begin();
+  leds.begin();
+  if (leds.isAvailable()) {
+    leds.show();
+    leds.setBrightness(50);
+    // Simple startup fade to white
+    for (int v = 0; v <= 255; v += 8) {
+      uint8_t vv = (uint8_t)v;
+      leds.fill(vv, vv, vv);
+      leds.show();
+      delay(10);
+    }
+  } else {
+    Serial.println("LED bridge not present; continuing without LED output.");
+  }
+  myAHT10.begin();
+
 }
 
 void loop(void) {
@@ -161,7 +163,7 @@ void loop(void) {
   }
 
   // LED pattern updates (non-blocking)
-  if (millis() - lastPatternMillis >= PATTERN_INTERVAL_MS) {
+  if (leds.isAvailable() && millis() - lastPatternMillis >= PATTERN_INTERVAL_MS) {
     lastPatternMillis = millis();
     patternPos = (patternPos + 1) & 0xFF;
 
@@ -206,8 +208,7 @@ void handleRoot() {
 
 void handleData() {
   char json[64];
-  snprintf(json, sizeof(json), "{\"temperature\":%.1f,\"humidity\":%.1f}",
-           currentTempC, currentHumidity);
+  snprintf(json, sizeof(json), "{\"temperature\":%.1f,\"humidity\":%.1f}", currentTempC, currentHumidity);
   server.send(200, "application/json", json);
 }
 
@@ -218,6 +219,11 @@ void handleLedSet() {
   int g = server.hasArg("g") ? server.arg("g").toInt() : -1;
   int b = server.hasArg("b") ? server.arg("b").toInt() : -1;
   int w = server.hasArg("w") ? server.arg("w").toInt() : -1;
+  if (!leds.isAvailable()) {
+    server.send(200, "application/json", "{\"status\":\"leds_unavailable\"}");
+    return;
+  }
+
   if (r >= 0 && g >= 0 && b >= 0) {
     staticR = (uint8_t)constrain(r, 0, 255);
     staticG = (uint8_t)constrain(g, 0, 255);
@@ -238,6 +244,11 @@ void handleLedSet() {
 }
 
 void handleLedPattern() {
+  if (!leds.isAvailable()) {
+    server.send(200, "application/json", "{\"status\":\"leds_unavailable\"}");
+    return;
+  }
+
   // pattern=name where name in {off, static, rainbow, chase}
   String p = server.arg("pattern");
   if (p == "off") {
@@ -286,6 +297,11 @@ void handleLedPattern() {
 }
 
 void handleLedBrightness() {
+  if (!leds.isAvailable()) {
+    server.send(200, "application/json", "{\"status\":\"leds_unavailable\"}");
+    return;
+  }
+
   if (!server.hasArg("b")) {
     server.send(400, "application/json", "{\"error\":\"missing b\"}");
     return;
@@ -304,12 +320,26 @@ bool loadCredentialsFromEEPROM() {
   if (EEPROM.read(EEPROM_FLAG_ADDR) != EEPROM_VALID_FLAG) {
     return false;
   }
+
+  bool ssidPresent = false;
   for (uint8_t i = 0; i < sizeof(WIFI_SSID); i++) {
-    WIFI_SSID[i] = EEPROM.read(EEPROM_SSID_ADDR + i);
+    uint8_t value = EEPROM.read(EEPROM_SSID_ADDR + i);
+    if (value != 0xFF && value != 0) {
+      ssidPresent = true;
+    }
+    WIFI_SSID[i] = (value == 0xFF || value == 0) ? '\0' : (char)value;
   }
+  if (!ssidPresent) {
+    WIFI_SSID[0] = '\0';
+    WIFI_PASSWORD[0] = '\0';
+    return false;
+  }
+
   for (uint8_t i = 0; i < sizeof(WIFI_PASSWORD); i++) {
-    WIFI_PASSWORD[i] = EEPROM.read(EEPROM_PASS_ADDR + i);
+    uint8_t value = EEPROM.read(EEPROM_PASS_ADDR + i);
+    WIFI_PASSWORD[i] = (value == 0xFF || value == 0) ? '\0' : (char)value;
   }
+
   local_IP[2] = EEPROM.read(EEPROM_SUBNET_ADDR);
   local_IP[3] = EEPROM.read(EEPROM_HOST_ADDR);
   return true;
@@ -335,6 +365,7 @@ bool attemptWiFiConnection(unsigned long timeoutMs) {
   }
 
   WiFi.disconnect(true);
+  WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("Connecting to WiFi");
   unsigned long start = millis();
@@ -347,8 +378,11 @@ bool attemptWiFiConnection(unsigned long timeoutMs) {
       return false;
     }
   }
+
   Serial.println();
-  Serial.print("Connected! IP address: ");
+  Serial.print("WiFi connected successfully to SSID: ");
+  Serial.println(WIFI_SSID);
+  Serial.print("Assigned IP: ");
   Serial.println(WiFi.localIP());
   return true;
 }
@@ -424,4 +458,16 @@ void startFailsafeAccessPoint() {
   server.onNotFound(handleUpdateForm);
   server.begin();
   Serial.println("AP web server started.");
+}
+
+void clearWifiEEPROM() {
+  EEPROM.begin(EEPROM_SIZE);
+
+  for (int i = 0; i < EEPROM_SIZE; i++) {
+    EEPROM.write(i, 0xFF);   // 0xFF = erased/default flash state
+  }
+
+  EEPROM.write(EEPROM_FLAG_ADDR, 0x00);
+  EEPROM.write(EEPROM_AP_FALLBACK_ADDR, 0x00);
+  EEPROM.commit();
 }
