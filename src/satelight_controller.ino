@@ -25,10 +25,14 @@
 #include <EEPROM.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <ArduinoOTA.h>
 #include <AHT10.h>
 #include <Wire.h>
+#include "SparkFun_VEML6030_Ambient_Light_Sensor.h"
 #include "NanoNeoBridge.h"
 #include "html_temperature_humidity.h"
+#include "html_light_sensor.h"
+#include "html_runtime_log.h"
 #include "html_update_wifi_credentials_.h"
 
 // ---- WiFi credentials ----
@@ -61,8 +65,22 @@ void handleLedBrightness();
 // ---- NeoPixel bridge ----
 NanoNeoBridge leds(SLAVE_ADDR, NUM_LEDS);
 
-// ---- AHT10 sensor ----
+// ---- Sensors ----
 AHT10 myAHT10(AHT10_ADDRESS_0X38);
+SparkFun_Ambient_Light myVEML6030(0x48);
+
+bool initialiseVEML6030() {
+
+  if (!myVEML6030.begin()) {
+    Serial.println(F("VEML6030 begin() failed after detection"));
+    return false;
+  }
+  myVEML6030.setGain(0.125f);
+  myVEML6030.setIntegTime(100);
+
+  appendLog("VEML6030 light sensor ready at 0x48");
+  return true;
+}
 
 // ---- Web server ----
 WebServer server(80);
@@ -70,21 +88,210 @@ WebServer server(80);
 // Latest readings, updated once per loop() pass
 float currentTempC = NAN;
 float currentHumidity = NAN;
+float currentLux = NAN;
+bool tempHumidityAvailable = false;
+bool lightSensorAvailable = false;
+char runtimeLog[4096] = "";
+
+void appendLog(const String& message) {
+  if (message.length() == 0) return;
+
+  char lineBuffer[160];
+  snprintf(lineBuffer, sizeof(lineBuffer), "%lu ms | %s\n", millis(), message.c_str());
+
+  size_t currentLen = strlen(runtimeLog);
+  size_t lineLen = strlen(lineBuffer);
+
+  if (currentLen + lineLen >= sizeof(runtimeLog)) {
+    size_t drop = (currentLen + lineLen + 1) - sizeof(runtimeLog);
+    if (drop > currentLen) {
+      drop = currentLen;
+    }
+    if (drop > 0) {
+      memmove(runtimeLog, runtimeLog + drop, currentLen - drop + 1);
+      currentLen -= drop;
+      runtimeLog[currentLen] = '\0';
+    }
+  }
+
+  strncat(runtimeLog, lineBuffer, sizeof(runtimeLog) - strlen(runtimeLog) - 1);
+  Serial.println(message);
+}
 
 // ---- LED/pattern state ----
-enum Pattern { PATTERN_OFF = 0, PATTERN_STATIC, PATTERN_RAINBOW, PATTERN_CHASE };
+enum Pattern { PATTERN_OFF = 0, PATTERN_STATIC, PATTERN_RAINBOW, PATTERN_CHASE, PATTERN_RANDOM_FADE };
 volatile Pattern currentPattern = PATTERN_OFF;
 uint8_t staticR = 0, staticG = 0, staticB = 0;
 uint8_t staticW = 0;
+uint8_t randomFadeCurrentR = 0, randomFadeCurrentG = 0, randomFadeCurrentB = 0;
+uint8_t randomFadeTargetR = 0, randomFadeTargetG = 0, randomFadeTargetB = 0;
 unsigned long lastPatternMillis = 0;
 const unsigned long PATTERN_INTERVAL_MS = 50;
 int patternPos = 0; // moving index used by patterns
 unsigned long lastSensorMillis = 0;
-const unsigned long SENSOR_INTERVAL_MS = 2000;
+const unsigned long SENSOR_INTERVAL_MS = 500;
+const unsigned long SENSOR_RESCAN_INTERVAL_MS = 10000;
+bool neoBridgeAvailable = false;
+enum SensorReadStage : uint8_t {
+  SENSOR_READ_TEMP_HUM = 0,
+  SENSOR_READ_LIGHT = 1,
+};
+SensorReadStage nextSensorReadStage = SENSOR_READ_TEMP_HUM;
+
+void nextRandomFadeTarget() {
+  randomFadeTargetR = random(256);
+  randomFadeTargetG = random(256);
+  randomFadeTargetB = random(256);
+
+  // Avoid stalling if the current colour already matches the newly chosen target.
+  if (randomFadeTargetR == randomFadeCurrentR && randomFadeTargetG == randomFadeCurrentG && randomFadeTargetB == randomFadeCurrentB) {
+    randomFadeTargetR = (randomFadeTargetR + 31) & 0xFF;
+    randomFadeTargetG = (randomFadeTargetG + 67) & 0xFF;
+    randomFadeTargetB = (randomFadeTargetB + 137) & 0xFF;
+  }
+}
+
+void startRandomFadePattern() {
+  randomFadeCurrentR = staticR;
+  randomFadeCurrentG = staticG;
+  randomFadeCurrentB = staticB;
+  nextRandomFadeTarget();
+  leds.fill(randomFadeCurrentR, randomFadeCurrentG, randomFadeCurrentB, staticW);
+  leds.show();
+}
+
+void updateRandomFadePattern() {
+  const int step = 8;
+
+  auto moveChannel = [](uint8_t& current, uint8_t target) {
+    if (current == target) return;
+    int currentValue = current;
+    if (current < target) {
+      currentValue = min(currentValue + step, (int)target);
+    } else {
+      currentValue = max(currentValue - step, (int)target);
+    }
+    current = (uint8_t)currentValue;
+  };
+
+  moveChannel(randomFadeCurrentR, randomFadeTargetR);
+  moveChannel(randomFadeCurrentG, randomFadeTargetG);
+  moveChannel(randomFadeCurrentB, randomFadeTargetB);
+
+  if (randomFadeCurrentR == randomFadeTargetR &&
+      randomFadeCurrentG == randomFadeTargetG &&
+      randomFadeCurrentB == randomFadeTargetB) {
+    nextRandomFadeTarget();
+  }
+
+  leds.fill(randomFadeCurrentR, randomFadeCurrentG, randomFadeCurrentB, staticW);
+  leds.show();
+}
+
+bool isI2CDevicePresent(uint8_t address) {
+  Wire.beginTransmission(address);
+  return Wire.endTransmission() == 0;
+}
+
+void scanI2C() {
+  String line = "Scanning I2C bus...";
+  appendLog(line);
+  Serial.println(line);
+  byte found = 0;
+  for (byte addr = 1; addr < 127; addr++) {
+    if (isI2CDevicePresent(addr)) {
+      String foundLine = "I2C device found at 0x" + String(addr < 16 ? "0" : "") + String(addr, HEX);
+      appendLog(foundLine);
+      Serial.println(foundLine);
+      found++;
+    }
+  }
+  if (found == 0) {
+    String noneLine = "No I2C devices found.";
+    appendLog(noneLine);
+    Serial.println(noneLine);
+  }
+}
+
+void initialiseNeoBridgeIfPresent() {
+  const bool bridgePresent = isI2CDevicePresent(SLAVE_ADDR);
+  if (!bridgePresent) {
+    if (neoBridgeAvailable) {
+      appendLog("NanoNeoBridge disconnected from 0x08; LED output disabled");
+    }
+    neoBridgeAvailable = false;
+    return;
+  }
+
+  if (!neoBridgeAvailable) {
+    neoBridgeAvailable = true;
+    leds.begin();
+    leds.setBrightness(50);
+    appendLog("NanoNeoBridge detected and initialised at 0x08");
+  }
+}
+
+void refreshSensorState() {
+  initialiseNeoBridgeIfPresent();
+
+  const bool ahtPresent = isI2CDevicePresent(AHT10_ADDRESS_0X38);
+  const bool vemlPresent = isI2CDevicePresent(0x48);
+
+  if (nextSensorReadStage == SENSOR_READ_TEMP_HUM) {
+    if (ahtPresent) {
+      if (!tempHumidityAvailable) {
+        tempHumidityAvailable = myAHT10.begin();
+        if (tempHumidityAvailable) {
+          appendLog("AHT10 temperature/humidity sensor ready");
+        } else {
+          appendLog("AHT10 temperature/humidity sensor begin failed at 0x38");
+        }
+      }
+
+      if (tempHumidityAvailable) {
+        currentTempC = myAHT10.readTemperature();
+        currentHumidity = myAHT10.readHumidity();
+        if (isnan(currentTempC) || isnan(currentHumidity)) {
+          currentTempC = NAN;
+          currentHumidity = NAN;
+          tempHumidityAvailable = false;
+        }
+      }
+    } else {
+      tempHumidityAvailable = false;
+      currentTempC = NAN;
+      currentHumidity = NAN;
+    }
+    nextSensorReadStage = SENSOR_READ_LIGHT;
+  } else {
+    if (vemlPresent) {
+      if (!lightSensorAvailable) {
+        lightSensorAvailable = initialiseVEML6030();
+      }
+
+      if (lightSensorAvailable) {
+        currentLux = static_cast<float>(myVEML6030.readLight());
+        if (isnan(currentLux) || currentLux < 0.0f) {
+          currentLux = NAN;
+          lightSensorAvailable = false;
+        }
+      }
+    } else {
+      lightSensorAvailable = false;
+      currentLux = NAN;
+    }
+    nextSensorReadStage = SENSOR_READ_TEMP_HUM;
+  }
+
+  Serial.print(F("Temperature:")); Serial.print(currentTempC); Serial.print(",");
+  Serial.print(F("Humidity:")); Serial.print(currentHumidity); Serial.print(",");
+  Serial.print(F("Lux:")); Serial.println(currentLux);
+}
 
 void setup(void) {
   // Keep serial alive first so we can always see startup diagnostics.
   Serial.begin(115200);
+  randomSeed(micros());
   EEPROM.begin(EEPROM_SIZE);
 
   if (shouldForceFailsafeAP()) {
@@ -108,29 +315,49 @@ void setup(void) {
     return;
   }
 
+  ArduinoOTA.setHostname("satelight-controller");
+  ArduinoOTA.setPassword("C#r1nDu$+r13s");
+  ArduinoOTA.onStart([]() {
+    Serial.println("OTA start");
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("OTA end");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("OTA progress: %u%%\n", (progress / (total > 0 ? total : 1)) * 100);
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("OTA error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+    else Serial.println("End Failed");
+  });
+  ArduinoOTA.begin();
+
   startNormalWebServer();
 
   // Only initialise devices that are needed in normal WiFi mode after a valid credential record is present.
   Wire.begin();
-  leds.begin();
-  if (leds.isAvailable()) {
-    leds.show();
-    leds.setBrightness(50);
-    // Simple startup fade to white
+  initialiseNeoBridgeIfPresent();
+  refreshSensorState();
+  refreshSensorState();
+
+  if (neoBridgeAvailable) {
+    // Simple startup fade to white only when the bridge is present.
     for (int v = 0; v <= 255; v += 8) {
       uint8_t vv = (uint8_t)v;
       leds.fill(vv, vv, vv);
       leds.show();
       delay(10);
     }
-  } else {
-    Serial.println("LED bridge not present; continuing without LED output.");
   }
-  myAHT10.begin();
 
 }
 
 void loop(void) {
+  ArduinoOTA.handle();
   server.handleClient(); // keep serving web requests frequently
 
   if (apMode) {
@@ -153,17 +380,20 @@ void loop(void) {
     return;
   }
 
-  // Non-blocking sensor read (every SENSOR_INTERVAL_MS)
+  // Poll readings frequently for responsive updates, and perform a slower device rediscovery pass.
   if (millis() - lastSensorMillis >= SENSOR_INTERVAL_MS) {
     lastSensorMillis = millis();
-    currentTempC = myAHT10.readTemperature();
-    currentHumidity = myAHT10.readHumidity();
-    Serial.print(F("Temperature:")); Serial.print(currentTempC); Serial.print(",");
-    Serial.print(F("Humidity:")); Serial.println(currentHumidity);
+    refreshSensorState();
+  }
+
+  static unsigned long lastSensorRescanMillis = 0;
+  if (millis() - lastSensorRescanMillis >= SENSOR_RESCAN_INTERVAL_MS) {
+    lastSensorRescanMillis = millis();
+    refreshSensorState();
   }
 
   // LED pattern updates (non-blocking)
-  if (leds.isAvailable() && millis() - lastPatternMillis >= PATTERN_INTERVAL_MS) {
+  if (neoBridgeAvailable && millis() - lastPatternMillis >= PATTERN_INTERVAL_MS) {
     lastPatternMillis = millis();
     patternPos = (patternPos + 1) & 0xFF;
 
@@ -194,6 +424,9 @@ void loop(void) {
         leds.show();
         break;
       }
+      case PATTERN_RANDOM_FADE:
+        updateRandomFadePattern();
+        break;
       case PATTERN_OFF:
       default:
         // nothing
@@ -206,24 +439,58 @@ void handleRoot() {
 	server.send(200, "text/html", html);
 }
 
+void handleLight() {
+  if (!lightSensorAvailable) {
+    server.send(404, "text/plain", "Light sensor unavailable");
+    return;
+  }
+  server.send(200, "text/html", html_light);
+}
+
 void handleData() {
-  char json[64];
-  snprintf(json, sizeof(json), "{\"temperature\":%.1f,\"humidity\":%.1f}", currentTempC, currentHumidity);
+  char json[256];
+  snprintf(json, sizeof(json),
+    "{\"temperature\":%.1f,\"humidity\":%.1f,\"lux\":%.0f,\"temperatureAvailable\":%s,\"humidityAvailable\":%s,\"luxAvailable\":%s}",
+    tempHumidityAvailable ? currentTempC : 0.0f,
+    tempHumidityAvailable ? currentHumidity : 0.0f,
+    lightSensorAvailable ? currentLux : 0.0f,
+    tempHumidityAvailable ? "true" : "false",
+    tempHumidityAvailable ? "true" : "false",
+    lightSensorAvailable ? "true" : "false");
   server.send(200, "application/json", json);
+}
+
+void handleLightData() {
+  if (!lightSensorAvailable) {
+    server.send(404, "text/plain", "Light sensor unavailable");
+    return;
+  }
+
+  char json[64];
+  snprintf(json, sizeof(json), "{\"lux\":%.0f}", currentLux);
+  server.send(200, "application/json", json);
+}
+
+void handleLogPage() {
+  server.send(200, "text/html", html_log);
+}
+
+void handleLogData() {
+  server.send(200, "text/plain", runtimeLog);
 }
 
 // --- LED control HTTP handlers ---
 void handleLedSet() {
+  if (!neoBridgeAvailable) {
+    server.send(503, "application/json", "{\"error\":\"led_bridge_unavailable\"}");
+    return;
+  }
+
   // Accept GET or POST args: r,g,b
   int r = server.hasArg("r") ? server.arg("r").toInt() : -1;
   int g = server.hasArg("g") ? server.arg("g").toInt() : -1;
   int b = server.hasArg("b") ? server.arg("b").toInt() : -1;
   int w = server.hasArg("w") ? server.arg("w").toInt() : -1;
-  if (!leds.isAvailable()) {
-    server.send(200, "application/json", "{\"status\":\"leds_unavailable\"}");
-    return;
-  }
-
   if (r >= 0 && g >= 0 && b >= 0) {
     staticR = (uint8_t)constrain(r, 0, 255);
     staticG = (uint8_t)constrain(g, 0, 255);
@@ -244,12 +511,12 @@ void handleLedSet() {
 }
 
 void handleLedPattern() {
-  if (!leds.isAvailable()) {
-    server.send(200, "application/json", "{\"status\":\"leds_unavailable\"}");
+  if (!neoBridgeAvailable) {
+    server.send(503, "application/json", "{\"error\":\"led_bridge_unavailable\"}");
     return;
   }
 
-  // pattern=name where name in {off, static, rainbow, chase}
+  // pattern=name where name in {off, static, rainbow, chase, random_fade}
   String p = server.arg("pattern");
   if (p == "off") {
     currentPattern = PATTERN_OFF;
@@ -269,6 +536,22 @@ void handleLedPattern() {
     currentPattern = PATTERN_CHASE;
     Serial.println("handleLedPattern: chase");
     server.send(200, "application/json", "{\"status\":\"chase\"}");
+    return;
+  }
+  if (p == "random_fade") {
+    currentPattern = PATTERN_RANDOM_FADE;
+    randomFadeCurrentR = staticR;
+    randomFadeCurrentG = staticG;
+    randomFadeCurrentB = staticB;
+    nextRandomFadeTarget();
+    leds.fill(randomFadeCurrentR, randomFadeCurrentG, randomFadeCurrentB, staticW);
+    bool ok = leds.show();
+    Serial.print("handleLedPattern: random_fade r="); Serial.print(randomFadeCurrentR);
+    Serial.print(" g="); Serial.print(randomFadeCurrentG);
+    Serial.print(" b="); Serial.print(randomFadeCurrentB);
+    Serial.print(" w="); Serial.print(staticW);
+    Serial.print(" show_ok="); Serial.println(ok);
+    server.send(200, "application/json", ok ? "{\"status\":\"random_fade\"}" : "{\"status\":\"i2c_error\"}");
     return;
   }
   if (p == "static") {
@@ -297,8 +580,8 @@ void handleLedPattern() {
 }
 
 void handleLedBrightness() {
-  if (!leds.isAvailable()) {
-    server.send(200, "application/json", "{\"status\":\"leds_unavailable\"}");
+  if (!neoBridgeAvailable) {
+    server.send(503, "application/json", "{\"error\":\"led_bridge_unavailable\"}");
     return;
   }
 
@@ -421,6 +704,10 @@ void startNormalWebServer() {
   server.stop();
   server.on("/", handleRoot);
   server.on("/data", handleData);
+  server.on("/light", handleLight);
+  server.on("/light/data", handleLightData);
+  server.on("/log", handleLogPage);
+  server.on("/logs/data", handleLogData);
   // LED control endpoints
   server.on("/leds/set", HTTP_GET, handleLedSet);
   server.on("/leds/pattern", HTTP_GET, handleLedPattern);
@@ -449,6 +736,8 @@ void startFailsafeAccessPoint() {
 
   server.stop();
   server.on("/", handleUpdateForm);
+  server.on("/log", handleLogPage);
+  server.on("/logs/data", handleLogData);
   server.on("/update", HTTP_GET, handleUpdateForm);
   server.on("/update", HTTP_POST, handleUpdate);
   // expose LED endpoints in AP mode too so clients can test lights

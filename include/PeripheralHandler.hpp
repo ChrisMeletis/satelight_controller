@@ -55,7 +55,7 @@ public:
 		_type = type;
 		_status = status;
 	}
-	virtual ~Peripheral() {}
+	virtual ~Peripheral() = default;
 
 	const uint8_t* getAddress() const { return _address; }
 	uint8_t getType()	const { return _type; }
@@ -73,13 +73,13 @@ private:
     float sensor_humidity;
 
 public:
-    Sensor_TH(uint8_t new_address[2], AHT10* lib) : Peripheral(SENSOR_TEMPERATURE_HUMIDITY, address[2], PERIPHERAL_STATUS_ONLINE)
+    Sensor_TH(uint8_t new_address[2], AHT10* lib) : Peripheral(SENSOR_TEMPERATURE_HUMIDITY, new_address, PERIPHERAL_STATUS_ONLINE)
     {
         sensor_library = lib; // Initialize member variable in the body
         sensor_temperature = 0.0f; // Initialize temperature
         sensor_humidity = 0.0f; // Initialize humidity
     }
-    ~Sensor_TH() { delete sensor_library; }
+    ~Sensor_TH() override = default;
 
     /**Get the sensor readings via I2C interface
      * Values are stored into the object's variables
@@ -87,8 +87,8 @@ public:
      * @return 1 if success, 0 if error
      */
     bool readSensorData(){
-		sensor_temperature == sensor_library->readTemperature();
-		sensor_humidity == sensor_library->readHumidity();
+		sensor_temperature = sensor_library->readTemperature();
+		sensor_humidity = sensor_library->readHumidity();
         if(sensor_temperature == 0xFF || sensor_humidity == 0xFF){
 			sensor_temperature = 0.0f;	// Reset temperature
         	sensor_humidity = 0.0f;		// Reset humidity
@@ -109,12 +109,12 @@ private:
     float sensor_lux;
 
 public:
-    Sensor_AL(uint8_t new_address[2], SparkFun_Ambient_Light* lib) : Peripheral(SENSOR_LIGHT, address[2], PERIPHERAL_STATUS_ONLINE)
+    Sensor_AL(uint8_t new_address[2], SparkFun_Ambient_Light* lib) : Peripheral(SENSOR_LIGHT, new_address, PERIPHERAL_STATUS_ONLINE)
     {
         sensor_library = lib;	// Initialize member variable in the body
         sensor_lux = 0.0f;		// Initialize luminance
     }
-    ~Sensor_AL() { delete sensor_library; }
+    ~Sensor_AL() override = default;
 
     /**Get the sensor readings via I2C interface
      * Values are stored into the object's variables
@@ -122,14 +122,14 @@ public:
      * @return 1 if success, 0 if error
      */
     bool readSensorData(){
-		sensor_lux == sensor_library->readLight();
-        // if(sensor_lux == 0xFF ){
-		// 	sensor_lux = 0.0f;	// Reset lux
-        //     setError();
-        //     return false;
-        // }
+		sensor_lux = static_cast<float>(sensor_library->readLight());
+        if (sensor_lux < 0.0f) {
+			sensor_lux = 0.0f;
+            setError();
+            return false;
+        }
         resetError();
         return true;
     }
-    float getTLight() const { return sensor_lux; }
+    float getLight() const { return sensor_lux; }
 };

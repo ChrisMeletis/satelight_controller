@@ -30,27 +30,7 @@ class NanoNeoBridge {
 
     // Call once in setup(), after Wire.begin() on the master.
     void begin() {
-      _deviceAvailable = probe();
-      if (!_deviceAvailable) {
-        Serial.println("NanoNeoBridge not detected; LED output disabled.");
-      }
-    }
-
-    bool isAvailable() const {
-      return _deviceAvailable;
-    }
-
-    bool probe() {
-      Wire.beginTransmission(_addr);
-      Wire.write(CMD_BRIGHTNESS);
-      Wire.write(0);
-      uint8_t err = Wire.endTransmission();
-      if (err == 0) {
-        _deviceAvailable = true;
-        return true;
-      }
-      _deviceAvailable = false;
-      return false;
+      // nothing device-specific to init; kept for API symmetry / future use
     }
 
     // Stage a pixel's color in the local buffer. Does not send anything yet.
@@ -72,10 +52,6 @@ class NanoNeoBridge {
     // transactions automatically (3-byte header + up to 29 data bytes each).
     // Returns true if every chunk was acknowledged (Wire.endTransmission()==0).
     bool show() {
-      if (!_deviceAvailable) {
-        return false;
-      }
-
       const uint8_t maxPayload = 29; // 32 - (cmd + offset + len)
       uint16_t offset = 0;
       bool ok = true;
@@ -95,7 +71,6 @@ class NanoNeoBridge {
             uint8_t err = Wire.endTransmission();
             if (err != 0) {
               ok = false;
-              _deviceAvailable = false;
               Serial.print("NanoNeoBridge::show chunk err offset="); Serial.print(offset);
               Serial.print(" len="); Serial.print(len);
               Serial.print(" err="); Serial.println(err);
@@ -116,10 +91,6 @@ class NanoNeoBridge {
 
     // Set global brightness (0-255). Takes effect on the slave's next show.
     bool setBrightness(uint8_t value) {
-      if (!_deviceAvailable) {
-        return false;
-      }
-
       Wire.beginTransmission(_addr);
       Wire.write(CMD_BRIGHTNESS);
       Wire.write(value);
@@ -127,11 +98,7 @@ class NanoNeoBridge {
       const int maxAttempts = 3;
       for (int attempt = 0; attempt < maxAttempts; ++attempt) {
         uint8_t err = Wire.endTransmission();
-        if (err == 0) {
-          _deviceAvailable = true;
-          return true;
-        }
-        _deviceAvailable = false;
+        if (err == 0) return true;
         Serial.print("NanoNeoBridge::setBrightness err="); Serial.println(err);
         Serial.print("NanoNeoBridge::setBrightness retry "); Serial.println(attempt + 1);
         delay(10);
@@ -145,10 +112,6 @@ class NanoNeoBridge {
 
     // Zero all pixels on the slave immediately (also clears local buffer).
     bool clear() {
-      if (!_deviceAvailable) {
-        return false;
-      }
-
       memset(_buf, 0, _frameBytes);
       Wire.beginTransmission(_addr);
       Wire.write(CMD_CLEAR);
@@ -157,7 +120,6 @@ class NanoNeoBridge {
       for (int attempt = 0; attempt < maxAttempts; ++attempt) {
         uint8_t err = Wire.endTransmission();
         if (err == 0) return true;
-        _deviceAvailable = false;
         Serial.print("NanoNeoBridge::clear err="); Serial.println(err);
         Serial.print("NanoNeoBridge::clear retry "); Serial.println(attempt + 1);
         delay(10);
@@ -177,7 +139,6 @@ class NanoNeoBridge {
     uint8_t  _numLeds;
     uint16_t _frameBytes;
     uint8_t* _buf;
-    bool     _deviceAvailable = true;
 };
 
 #endif
