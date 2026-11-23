@@ -61,6 +61,7 @@ void setForcedFailsafeAP(bool enable);
 void handleLedSet();
 void handleLedPattern();
 void handleLedBrightness();
+void handleLedSpeed();
 
 // ---- NeoPixel bridge ----
 NanoNeoBridge leds(SLAVE_ADDR, NUM_LEDS);
@@ -119,14 +120,17 @@ void appendLog(const String& message) {
 }
 
 // ---- LED/pattern state ----
-enum Pattern { PATTERN_OFF = 0, PATTERN_STATIC, PATTERN_RAINBOW, PATTERN_CHASE, PATTERN_RANDOM_FADE };
+enum Pattern { PATTERN_OFF = 0, PATTERN_STATIC, PATTERN_RAINBOW, PATTERN_CHASE, PATTERN_RANDOM_FADE, PATTERN_OUTWARD_TWO_COLOR };
 volatile Pattern currentPattern = PATTERN_OFF;
 uint8_t staticR = 0, staticG = 0, staticB = 0;
 uint8_t staticW = 0;
+uint8_t outwardR1 = 255, outwardG1 = 0, outwardB1 = 0;
+uint8_t outwardR2 = 0, outwardG2 = 0, outwardB2 = 255;
 uint8_t randomFadeCurrentR = 0, randomFadeCurrentG = 0, randomFadeCurrentB = 0;
 uint8_t randomFadeTargetR = 0, randomFadeTargetG = 0, randomFadeTargetB = 0;
 unsigned long lastPatternMillis = 0;
-const unsigned long PATTERN_INTERVAL_MS = 50;
+const unsigned long PATTERN_INTERVAL_MS = 30;
+unsigned long patternIntervalMillis = PATTERN_INTERVAL_MS;
 int patternPos = 0; // moving index used by patterns
 unsigned long lastSensorMillis = 0;
 const unsigned long SENSOR_INTERVAL_MS = 500;
@@ -393,7 +397,7 @@ void loop(void) {
   }
 
   // LED pattern updates (non-blocking)
-  if (neoBridgeAvailable && millis() - lastPatternMillis >= PATTERN_INTERVAL_MS) {
+  if (neoBridgeAvailable && millis() - lastPatternMillis >= patternIntervalMillis) {
     lastPatternMillis = millis();
     patternPos = (patternPos + 1) & 0xFF;
 
@@ -427,6 +431,25 @@ void loop(void) {
       case PATTERN_RANDOM_FADE:
         updateRandomFadePattern();
         break;
+      case PATTERN_OUTWARD_TWO_COLOR: {
+        leds.fill(0, 0, 0, staticW);
+        int phase = (patternPos / 5) % 10;
+        int outwardPos = phase < 5 ? phase : 9 - phase;
+        int leftPos = 2 - outwardPos;
+        int rightPos = 2 + outwardPos;
+
+        // Repeat the two moving LEDs independently for each 5-LED row/block.
+        for (uint8_t block = 0; block < NUM_LEDS; block += 5) {
+          if (leftPos >= 0 && block + leftPos < NUM_LEDS) {
+            leds.setPixel(block + leftPos, outwardR1, outwardG1, outwardB1, 0);
+          }
+          if (rightPos <= 4 && block + rightPos < NUM_LEDS) {
+            leds.setPixel(block + rightPos, outwardR2, outwardG2, outwardB2, 0);
+          }
+        }
+        leds.show();
+        break;
+      }
       case PATTERN_OFF:
       default:
         // nothing
@@ -516,7 +539,7 @@ void handleLedPattern() {
     return;
   }
 
-  // pattern=name where name in {off, static, rainbow, chase, random_fade}
+  // pattern=name where name in {off, static, rainbow, chase, random_fade, outward_two_color}
   String p = server.arg("pattern");
   if (p == "off") {
     currentPattern = PATTERN_OFF;
@@ -576,6 +599,20 @@ void handleLedPattern() {
     server.send(200, "application/json", ok2 ? "{\"status\":\"static\"}" : "{\"status\":\"i2c_error\"}");
     return;
   }
+  if (p == "outward_two_color") {
+    outwardR1 = server.hasArg("r1") ? (uint8_t)constrain(server.arg("r1").toInt(), 0, 255) : outwardR1;
+    outwardG1 = server.hasArg("g1") ? (uint8_t)constrain(server.arg("g1").toInt(), 0, 255) : outwardG1;
+    outwardB1 = server.hasArg("b1") ? (uint8_t)constrain(server.arg("b1").toInt(), 0, 255) : outwardB1;
+    outwardR2 = server.hasArg("r2") ? (uint8_t)constrain(server.arg("r2").toInt(), 0, 255) : outwardR2;
+    outwardG2 = server.hasArg("g2") ? (uint8_t)constrain(server.arg("g2").toInt(), 0, 255) : outwardG2;
+    outwardB2 = server.hasArg("b2") ? (uint8_t)constrain(server.arg("b2").toInt(), 0, 255) : outwardB2;
+    if (server.hasArg("w")) staticW = (uint8_t)constrain(server.arg("w").toInt(), 0, 255);
+    patternPos = 0;
+    currentPattern = PATTERN_OUTWARD_TWO_COLOR;
+    Serial.println("handleLedPattern: outward_two_color");
+    server.send(200, "application/json", "{\"status\":\"outward_two_color\"}");
+    return;
+  }
   server.send(400, "application/json", "{\"error\":\"unknown pattern\"}");
 }
 
@@ -593,6 +630,24 @@ void handleLedBrightness() {
   bool ok = leds.setBrightness((uint8_t)constrain(bval, 0, 255));
   Serial.print("handleLedBrightness: b="); Serial.print(bval); Serial.print(" ok="); Serial.println(ok);
   server.send(200, "application/json", ok ? "{\"status\":\"ok\"}" : "{\"status\":\"i2c_error\"}");
+}
+
+void handleLedSpeed() {
+  if (!neoBridgeAvailable) {
+    server.send(503, "application/json", "{\"error\":\"led_bridge_unavailable\"}");
+    return;
+  }
+
+  if (!server.hasArg("speed")) {
+    server.send(400, "application/json", "{\"error\":\"missing speed\"}");
+    return;
+  }
+
+  int speed = constrain(server.arg("speed").toInt(), 10, 100);
+  patternIntervalMillis = map(speed, 10, 100, 100, 10);
+  Serial.print("handleLedSpeed: speed="); Serial.print(speed);
+  Serial.print(" interval="); Serial.println(patternIntervalMillis);
+  server.send(200, "application/json", "{\"status\":\"ok\"}");
 }
 
 /** ---- WiFi failsafe: EEPROM credential storage ----
@@ -712,6 +767,7 @@ void startNormalWebServer() {
   server.on("/leds/set", HTTP_GET, handleLedSet);
   server.on("/leds/pattern", HTTP_GET, handleLedPattern);
   server.on("/leds/brightness", HTTP_GET, handleLedBrightness);
+  server.on("/leds/speed", HTTP_GET, handleLedSpeed);
   server.on("/update_wifi", handleUpdateForm);
   server.on("/update", HTTP_POST, handleUpdate);
   server.begin();
@@ -744,6 +800,7 @@ void startFailsafeAccessPoint() {
   server.on("/leds/set", HTTP_GET, handleLedSet);
   server.on("/leds/pattern", HTTP_GET, handleLedPattern);
   server.on("/leds/brightness", HTTP_GET, handleLedBrightness);
+  server.on("/leds/speed", HTTP_GET, handleLedSpeed);
   server.onNotFound(handleUpdateForm);
   server.begin();
   Serial.println("AP web server started.");

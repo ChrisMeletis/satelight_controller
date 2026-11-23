@@ -167,6 +167,31 @@ const char html[] = R"=====(
       width: 100%;
     }
 
+    .outward-menu {
+      width: 100%;
+      max-width: 280px;
+      margin: 12px auto 0;
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 10px;
+      background: rgba(0,0,0,0.12);
+      padding: 7px 10px;
+    }
+
+    .outward-menu summary {
+      cursor: pointer;
+      color: var(--text);
+      font-size: 0.85rem;
+      text-align: center;
+    }
+
+    .outward-menu-content {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 8px;
+      margin-top: 8px;
+    }
+
     @media (max-width: 980px) {
       .dashboard {
         grid-template-columns: 1fr;
@@ -210,7 +235,7 @@ const char html[] = R"=====(
           <canvas id="colorWheel" width="200" height="200" style="border-radius:8px;background:#1c2530"></canvas>
         </div>
         <div class="color-controls">
-          <div id="colorPreview"></div>
+          <div id="colorPreview" style="width:56px;height:56px;border-radius:8px;background:#ffffff;border:1px solid #222;"></div>
           <div class="mini-label">White (warm)</div>
           <input id="whiteSlider" type="range" min="0" max="255" value="0" style="width:120px;">
         </div>
@@ -226,6 +251,18 @@ const char html[] = R"=====(
         <div class="mini-label" style="margin-bottom:6px;">Brightness</div>
         <input id="bright" type="range" min="0" max="255" value="50" style="width:100%;">
       </div>
+      <div style="width:100%;margin-top:12px;">
+        <div class="mini-label" style="margin-bottom:6px;">Pattern Speed</div>
+        <input id="speed" type="range" min="10" max="100" value="100" style="width:100%;">
+      </div>
+      <details class="outward-menu">
+        <summary>Outward 2-Color Pattern</summary>
+        <div class="outward-menu-content">
+          <button id="color1Select" type="button" onclick="selectOutwardColor(1)" style="padding:0;border:2px solid #fff;"><div id="outwardPreview1" style="width:36px;height:36px;border-radius:6px;background:#ff0000;"></div></button>
+          <button id="color2Select" type="button" onclick="selectOutwardColor(2)" style="padding:0;border:2px solid transparent;"><div id="outwardPreview2" style="width:36px;height:36px;border-radius:6px;background:#0000ff;"></div></button>
+          <button type="button" onclick="setPattern('outward_two_color')">Start</button>
+        </div>
+      </details>
     </div>
   </div>
 
@@ -372,9 +409,23 @@ const char html[] = R"=====(
     wctx.putImageData(img, 0, 0);
 
     let selectedColor = [255, 255, 255];
+    let outwardColor1 = [255, 0, 0];
+    let outwardColor2 = [0, 0, 255];
+    let outwardColorSlot = 0;
+
+    function selectOutwardColor(slot) {
+      outwardColorSlot = slot;
+      document.getElementById('color1Select').style.border = slot === 1 ? '2px solid #fff' : '2px solid transparent';
+      document.getElementById('color2Select').style.border = slot === 2 ? '2px solid #fff' : '2px solid transparent';
+    }
+
     function updatePreview() {
       document.getElementById('colorPreview').style.background = `rgb(${selectedColor[0]},${selectedColor[1]},${selectedColor[2]})`;
+      document.getElementById('outwardPreview1').style.background = `rgb(${outwardColor1[0]},${outwardColor1[1]},${outwardColor1[2]})`;
+      document.getElementById('outwardPreview2').style.background = `rgb(${outwardColor2[0]},${outwardColor2[1]},${outwardColor2[2]})`;
     }
+
+    updatePreview();
 
     wheel.addEventListener('click', (ev) => {
       const rect = wheel.getBoundingClientRect();
@@ -387,9 +438,20 @@ const char html[] = R"=====(
       const hue = (angle < 0 ? angle + Math.PI * 2 : angle) / (Math.PI * 2);
       const sat = d / radius;
       selectedColor = hsvToRgb(hue, sat, 1);
+
+      if (outwardColorSlot === 1) {
+        outwardColor1 = selectedColor;
+        outwardColorSlot = 0;
+        document.getElementById('color1Select').style.border = '2px solid transparent';
+      } else if (outwardColorSlot === 2) {
+        outwardColor2 = selectedColor;
+        outwardColorSlot = 0;
+        document.getElementById('color2Select').style.border = '2px solid transparent';
+      } else {
+        const w = document.getElementById('whiteSlider').value;
+        sendLedRequest(`/leds/set?r=${selectedColor[0]}&g=${selectedColor[1]}&b=${selectedColor[2]}&w=${w}`);
+      }
       updatePreview();
-      const w = document.getElementById('whiteSlider').value;
-      sendLedRequest(`/leds/set?r=${selectedColor[0]}&g=${selectedColor[1]}&b=${selectedColor[2]}&w=${w}`);
     });
 
     document.getElementById('whiteSlider').addEventListener('input', (e) => {
@@ -398,18 +460,47 @@ const char html[] = R"=====(
       sendLedRequest(`/leds/set?r=${selectedColor[0]}&g=${selectedColor[1]}&b=${selectedColor[2]}&w=${w}`);
     });
 
+    document.getElementById('speed').addEventListener('input', (e) => {
+      sendLedRequest(`/leds/speed?speed=${e.target.value}`);
+    });
+
+    document.getElementById('bright').addEventListener('input', (e) => {
+      sendLedRequest(`/leds/brightness?b=${e.target.value}`);
+    });
+
     function setPattern(name) {
       const w = document.getElementById('whiteSlider').value;
       if (name === 'static') {
         sendLedRequest(`/leds/pattern?pattern=static&r=${selectedColor[0]}&g=${selectedColor[1]}&b=${selectedColor[2]}&w=${w}`);
+      } else if (name === 'outward_two_color') {
+        sendLedRequest(`/leds/pattern?pattern=outward_two_color&r1=${outwardColor1[0]}&g1=${outwardColor1[1]}&b1=${outwardColor1[2]}&r2=${outwardColor2[0]}&g2=${outwardColor2[1]}&b2=${outwardColor2[2]}&w=${w}`);
       } else {
         sendLedRequest(`/leds/pattern?pattern=${name}`);
       }
     }
 
-    document.getElementById('bright').addEventListener('input', (e) => {
-      sendLedRequest(`/leds/brightness?b=${e.target.value}`);
-    });
+    const color1Input = document.getElementById('color1Select');
+    const color2Input = document.getElementById('color2Select');
+
+    if (color1Input) {
+      color1Input.addEventListener('input', (e) => {
+        const r = parseInt(e.target.getAttribute('data-r'));
+        const g = parseInt(e.target.getAttribute('data-g'));
+        const b = parseInt(e.target.getAttribute('data-b'));
+        outwardColor1 = [r, g, b];
+        updatePreview();
+      });
+    }
+
+    if (color2Input) {
+      color2Input.addEventListener('input', (e) => {
+        const r = parseInt(e.target.getAttribute('data-r'));
+        const g = parseInt(e.target.getAttribute('data-g'));
+        const b = parseInt(e.target.getAttribute('data-b'));
+        outwardColor2 = [r, g, b];
+        updatePreview();
+      });
+    }
   </script>
 </body>
 </html>
